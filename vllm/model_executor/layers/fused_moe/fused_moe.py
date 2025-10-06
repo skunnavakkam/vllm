@@ -663,6 +663,225 @@ def invoke_fused_moe_kernel(A: torch.Tensor,
             **config,
         )
 
+def invoke_fused_moe_kernel_lora(A: torch.Tensor,
+                            B: torch.Tensor,
+                            C: torch.Tensor,
+                            B_lora_a, 
+                            B_lora_b,
+                            A_scale: Optional[torch.Tensor],
+                            B_scale: Optional[torch.Tensor],
+                            B_zp: Optional[torch.Tensor],
+                            topk_weights: Optional[torch.Tensor],
+                            sorted_token_ids: torch.Tensor,
+                            expert_ids: torch.Tensor,
+                            num_tokens_post_padded: torch.Tensor,
+                            mul_routed_weight: bool,
+                            top_k: int,
+                            config: dict[str, Any],
+                            compute_type: tl.dtype,
+                            use_fp8_w8a8: bool,
+                            use_int8_w8a8: bool,
+                            use_int8_w8a16: bool,
+                            use_int4_w4a16: bool,
+                            per_channel_quant: bool,
+                            block_shape: Optional[list[int]] = None,
+                            B_bias: Optional[torch.Tensor] = None) -> None:
+    """Invoke fused MoE kernel with LoRA for mixture of experts.
+    
+    Dispatches to Triton kernel or CUDA implementation for computing MoE
+    with LoRA support and various quantization schemes.
+    
+    Args:
+        A: Input activations [num_tokens, hidden_size].
+        B: Expert weights. Shape varies by usage:
+            - For w1: [num_experts, intermediate_size, hidden_size]
+            - For w2: [num_experts, hidden_size, intermediate_size]
+        C: Output tensor [num_tokens, top_k, output_size].
+        B_lora_a: LoRA A weights, same shape as B.
+        B_lora_b: LoRA B weights, same shape as B.
+        A_scale: Activation quantization scale (FP8/INT8 w8a8 only).
+        B_scale: Weight quantization scale. Required for quantized modes.
+            Shape depends on quantization scheme and block_shape.
+        B_zp: Weight zero-point (INT4/INT8 w*a16 only).
+        topk_weights: Router weights [num_tokens, top_k]. Scales expert
+            outputs when mul_routed_weight=True.
+        sorted_token_ids: Token indices sorted by expert [num_tokens *
+            top_k].
+        expert_ids: Expert ID per token [num_tokens * top_k].
+        num_tokens_post_padded: Tokens processed per expert
+            (optimization).
+        mul_routed_weight: Whether to apply router weights in kernel.
+        top_k: Number of experts per token.
+        config: Kernel config with BLOCK_SIZE_M, BLOCK_SIZE_N,
+            BLOCK_SIZE_K, GROUP_SIZE_M for Triton tile sizes.
+        compute_type: Triton dtype (tl.float16/bfloat16/float32).
+        use_fp8_w8a8: Enable FP8 8-bit quantization.
+        use_int8_w8a8: Enable INT8 8-bit quantization.
+        use_int8_w8a16: Enable INT8 weight with FP16 activation.
+        use_int4_w4a16: Enable INT4 weight with FP16 activation.
+        per_channel_quant: Use per-channel vs per-tensor quantization.
+        block_shape: Group quantization block size [block_k, block_n].
+            Required for INT4/INT8 w*a16 with group quantization.
+        B_bias: Optional bias [num_experts, output_size].
+    
+    Returns:
+        None. Results written in-place to C.
+    """
+    assert topk_weights is not None or not mul_routed_weight
+    assert topk_weights is None or topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    if use_fp8_w8a8 or use_int8_w8a8:
+        assert B_scale is not None
+        assert (block_shape is None
+                or triton.cdiv(B.size(-2), block_shape[0]) == B_scale.size(-2))
+        assert (block_shape is None
+                or triton.cdiv(B.size(-1), block_shape[1]) == B_scale.size(-1))
+
+    elif use_int8_w8a16 or use_int4_w4a16:
+        assert B_scale is not None
+        assert block_shape is None or block_shape[0] == 0
+    else:
+        assert A_scale is None
+        assert B_scale is None
+
+    M = A.size(0)
+    num_tokens = M * top_k
+
+    EM = sorted_token_ids.size(0)
+    if A.size(0) < config["BLOCK_SIZE_M"]:
+        # optimize for small batch_size.
+        # We assume that top_ids of each token is unique,
+        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
+        # and we can skip some invalid blocks.
+        EM = min(sorted_token_ids.size(0),
+                 A.size(0) * top_k * config['BLOCK_SIZE_M'])
+    grid = lambda META: (triton.cdiv(EM, META['BLOCK_SIZE_M']) * triton.cdiv(
+        B.size(1), META['BLOCK_SIZE_N']), )
+    HAS_BIAS = B_bias is not None
+    if (use_int8_w8a16 or use_int4_w4a16) and \
+            block_shape is not None and block_shape[1] > 0:
+        assert B_scale is not None and B_scale.ndim == 3
+        assert B_zp is None or B_zp.ndim == 3
+
+        use_moe_wna16_cuda = should_moe_wna16_use_cuda(
+            num_valid_tokens=num_tokens,
+            group_size=block_shape[1],
+            num_experts=B.size(0),
+            bit=4 if use_int4_w4a16 else 8)
+        config = config.copy()
+        config.update(
+            get_moe_wna16_block_config(config=config,
+                                       use_moe_wna16_cuda=use_moe_wna16_cuda,
+                                       num_valid_tokens=num_tokens,
+                                       size_k=A.size(1),
+                                       size_n=B.size(1),
+                                       num_experts=B.size(1),
+                                       group_size=block_shape[1],
+                                       real_top_k=top_k,
+                                       block_size_m=config["BLOCK_SIZE_M"]))
+
+        if use_moe_wna16_cuda:
+            bit = 4 if use_int4_w4a16 else 8
+            ops.moe_wna16_gemm(A, C, B, B_scale, B_zp,
+                               topk_weights if mul_routed_weight else None,
+                               sorted_token_ids, expert_ids,
+                               num_tokens_post_padded, top_k,
+                               config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"],
+                               config["BLOCK_SIZE_K"], bit)
+            return
+
+        fused_moe_kernel_gptq_awq[grid](
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.size(1),
+            A.size(1),
+            EM,
+            num_tokens,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(2),
+            B_scale.stride(1),
+            B_zp.stride(0) if B_zp is not None else 0,
+            B_zp.stride(2) if B_zp is not None else 0,
+            B_zp.stride(1) if B_zp is not None else 0,
+            block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+            group_size=block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            has_zp=B_zp is not None,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a16=use_int8_w8a16,
+            **config,
+        )
+    else:
+        config = config.copy()
+        BLOCK_SIZE_K = config.pop("BLOCK_SIZE_K")
+        if block_shape is not None:
+            BLOCK_SIZE_K = min(BLOCK_SIZE_K, min(block_shape[0],
+                                                 block_shape[1]))
+        fused_moe_kernel[grid](
+            A,
+            B,
+            C,
+            B_bias,
+            A_scale,
+            B_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            B.size(1),
+            B.size(2),
+            EM,
+            num_tokens,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            A_scale.stride(0)
+            if A_scale is not None and A_scale.ndim == 2 else 0,
+            A_scale.stride(1)
+            if A_scale is not None and A_scale.ndim == 2 else 0,
+            B_scale.stride(0)
+            if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_scale.stride(2)
+            if B_scale is not None and B_scale.ndim == 3 else 0,
+            B_scale.stride(1)
+            if B_scale is not None and B_scale.ndim >= 2 else 0,
+            B_bias.stride(0) if B_bias is not None else 0,
+            B_bias.stride(1) if B_bias is not None else 0,
+            0 if block_shape is None else block_shape[0],
+            0 if block_shape is None else block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            use_fp8_w8a8=use_fp8_w8a8,
+            use_int8_w8a8=use_int8_w8a8,
+            use_int8_w8a16=use_int8_w8a16,
+            per_channel_quant=per_channel_quant,
+            HAS_BIAS=HAS_BIAS,
+            BLOCK_SIZE_K=BLOCK_SIZE_K,
+            **config,
+        )
+
 
 # Adapted from: https://github.com/sgl-project/sglang/pull/2628
 def get_config_file_name(E: int,
@@ -1603,6 +1822,302 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
         expert_tokens_meta: Optional[mk.ExpertTokensMetadata],
         apply_router_weight_on_input: bool,
     ):
+        # ============================================================================
+        # SECTION 1: INPUT VALIDATION
+        # Verify tensor shapes, memory layout, and data types are compatible
+        # ============================================================================
+        
+        # For int4 quantization, hidden dim is packed (divided by 2)
+        if self.quant_config.use_int4_w4a16:
+            assert hidden_states.size(-1) // 2 == w1.size(2), (
+                "Hidden size mismatch")
+        else:
+            # Standard case: hidden_states last dim must match w1's K dimension
+            assert hidden_states.size(-1) == w1.size(2), \
+                (f"Hidden size mismatch {hidden_states.size(-1)} "
+                 f"!= {w1.size(2)}")
+
+        # Ensure memory layout is optimal for CUDA kernels
+        assert hidden_states.is_contiguous(
+        ), "Hidden_states must be contiguous"
+        assert hidden_states.dim() == 2  # Shape: [num_tokens, hidden_dim]
+        
+        # Weight matrices must have unit stride in last dimension for efficient access
+        assert w1.stride(-1) == 1, "Stride of last dimension must be 1"
+        assert w2.stride(-1) == 1, "Stride of last dimension must be 1"
+        
+        # Verify supported data types for computation
+        assert hidden_states.dtype in [
+            torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn
+        ]
+
+        # ============================================================================
+        # SECTION 2: EXTRACT PROBLEM DIMENSIONS
+        # This function carefully extracts dimensions from tensors to handle edge
+        # cases like quantization (int4 packs 2 values per element) and different
+        # tensor layouts (standard 2D vs batched 3D format).
+        #
+        # Returns:
+        #   E = number of experts (e.g., 8 experts in the model)
+        #   num_tokens = number of input tokens (M in matmul notation)
+        #   N = intermediate_size from w1 output (typically 4x hidden_size)
+        #   K = hidden_size for input/output (e.g., 4096)
+        #   top_k_num = experts per token (e.g., 2 means each token uses 2 experts)
+        #
+        # Example: For a model with 8 experts, hidden_size=4096, intermediate=16384,
+        #          processing 100 tokens with top_k=2:
+        #          E=8, num_tokens=100, N=16384, K=4096, top_k_num=2
+        #
+        # Why this function exists: Can't just read dimensions directly because:
+        # - int4 quantization packs values, so w1.size(-1) would be N/2, not N
+        # - Some kernels transpose weights, changing dimension order
+        # - Need to handle both 2D [tokens, hidden] and 3D [experts, tokens, hidden]
+        # ============================================================================
+        E, num_tokens, N, K, top_k_num = mk._moe_problem_size(
+            hidden_states, w1, w2, topk_ids)
+
+        # If global expert count not provided, use local count
+        if global_num_experts == -1:
+            global_num_experts = E
+
+        # ============================================================================
+        # SECTION 3: KERNEL CONFIGURATION
+        # Get optimal Triton kernel parameters (block sizes, warps, etc.) based on
+        # problem size. This may load pre-tuned configs or use defaults.
+        # ============================================================================
+        config = try_get_optimal_moe_config(
+            w1.size(),
+            w2.size(),
+            top_k_num,
+            self.quant_config.config_name(hidden_states.dtype),
+            num_tokens,
+            block_shape=self.block_shape,
+        )
+
+        # ============================================================================
+        # SECTION 4: DATA TYPE MAPPING
+        # Map PyTorch dtypes to Triton compute types
+        # Note: float8_e4m3fn uses bfloat16 for compute
+        # ============================================================================
+        if hidden_states.dtype == torch.bfloat16:
+            compute_type = tl.bfloat16
+        elif hidden_states.dtype == torch.float16:
+            compute_type = tl.float16
+        elif hidden_states.dtype == torch.float32:
+            compute_type = tl.float32
+        elif hidden_states.dtype == torch.float8_e4m3fn:
+            compute_type = tl.bfloat16
+        else:
+            raise ValueError(
+                f"Unsupported compute_type: {hidden_states.dtype}")
+
+        # ============================================================================
+        # SECTION 5: ALLOCATE INTERMEDIATE BUFFERS
+        # Reuse workspace memory for different stages to minimize allocation overhead
+        # cache1: stores w1 matmul output (before activation)
+        # cache2: stores activated values (after SiLU/GELU)
+        # cache3: stores w2 matmul output (final per-expert outputs)
+        # ============================================================================
+        
+        # intermediate_cache1: [num_tokens, top_k_num, N] - output of first matmul
+        # Note that the output tensor might be in workspace1
+        intermediate_cache1 = _resize_cache(workspace2,
+                                            (num_tokens, top_k_num, N))
+        # intermediate_cache2: [num_tokens * top_k_num, N//2] - activated values
+        # (N//2 because gated activation like SiLU uses half for gate, half for value)
+        intermediate_cache2 = _resize_cache(workspace13,
+                                            (num_tokens * top_k_num, N // 2))
+        # intermediate_cache3: [num_tokens, top_k_num, K] - output of second matmul
+        intermediate_cache3 = _resize_cache(workspace2,
+                                            (num_tokens, top_k_num, K))
+
+        # ============================================================================
+        # SECTION 6: TOKEN-EXPERT ALIGNMENT (PERMUTATION HAPPENS HERE!)
+        # This is where the "permutation" happens - but it's IMPLICIT, not explicit.
+        #
+        # moe_align_block_size() computes:
+        #   - sorted_token_ids: indices that map tokens to experts in sorted order
+        #   - expert_ids: which expert handles each block
+        #   - num_tokens_post_padded: total tokens after padding to block size
+        #
+        # IMPORTANT: We DON'T physically reorder hidden_states here!
+        # Instead, the Triton kernel uses sorted_token_ids to GATHER the right
+        # tokens on-the-fly during computation.
+        #
+        # Example with 4 tokens, 2 experts, top_k=1:
+        #   topk_ids = [1, 0, 1, 0]  # token 0→expert 1, token 1→expert 0, etc.
+        #   sorted_token_ids = [1, 3, 0, 2]  # reordered: expert 0's tokens, then 1's
+        #   expert_ids = [0, 1]  # which expert for each block
+        #
+        # Alternative approach (DeepGemm/CUTLASS): Call moe_permute() to physically
+        # reorder hidden_states, then call moe_unpermute() after computation.
+        # Triton approach is more efficient because it avoids the permute overhead.
+        # ============================================================================
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
+                                 global_num_experts, expert_map))
+
+        # ============================================================================
+        # SECTION 7: FIRST MATRIX MULTIPLICATION (UPWARD PROJECTION)
+        # Computes: hidden_states @ w1 for each expert
+        # Input: [num_tokens, K] x [E, N, K] -> Output: [num_tokens, top_k_num, N]
+        # This expands from hidden_size to intermediate_size (typically 4x larger)
+        #
+        # **HOW PERMUTATION WORKS IN THE KERNEL:**
+        # The kernel receives sorted_token_ids and uses it to GATHER tokens:
+        #   Line 373 (kernel): offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+        #   Line 389 (kernel): a_ptrs = a_ptr + (offs_token[:, None] // top_k * stride_am + ...)
+        # This means each Triton block loads the RIGHT tokens for its assigned expert,
+        # without needing to physically reorder the entire hidden_states tensor!
+        # ============================================================================
+        invoke_fused_moe_kernel(
+            hidden_states,           # Input activations (NOT reordered!)
+            w1,                      # Expert weights (upward projection)
+            intermediate_cache1,     # Output buffer
+            a1q_scale,              # Quantization scale for activations
+            self.w1_scale,          # Quantization scale for weights
+            self.w1_zp,             # Zero point for weight quantization
+            None,                   # topk_weights - not applied here
+            sorted_token_ids,       # Token indices sorted by expert assignment (PERMUTATION!)
+            expert_ids,             # Expert index for each block
+            num_tokens_post_padded, # Total tokens after padding
+            False,                  # mul_routed_weights - don't multiply by router weights yet
+            top_k_num,              # Number of experts per token
+            config,                 # Kernel configuration (block sizes, etc.)
+            compute_type=compute_type,
+            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            use_int8_w8a16=self.quant_config.use_int8_w8a16,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            B_bias=self.w1_bias,
+        )
+
+        # ============================================================================
+        # SECTION 8: ACTIVATION FUNCTION
+        # Apply gated activation (e.g., SiLU) that splits the N-dim output into
+        # two N/2 parts: one is the gate, one is the value. Result is N/2 dim.
+        # Common: SiLU(x[:N/2]) * x[N/2:] or GELU(x[:N/2]) * x[N/2:]
+        # ============================================================================
+        self.activation(activation, intermediate_cache2,
+                        intermediate_cache1.view(-1, N))
+
+        # ============================================================================
+        # SECTION 9: QUANTIZE INTERMEDIATE ACTIVATIONS
+        # Before second matmul, optionally quantize activations to fp8/int8/int4
+        # to reduce memory bandwidth and computation cost
+        # ============================================================================
+        a2q_scale: Optional[torch.Tensor] = None
+        qintermediate_cache2, a2q_scale = moe_kernel_quantize_input(
+            intermediate_cache2, self.a2_scale, self.quant_dtype,
+            self.per_act_token_quant, self.block_shape)
+
+        # ============================================================================
+        # SECTION 10: SECOND MATRIX MULTIPLICATION (DOWNWARD PROJECTION)
+        # Computes: activated @ w2 for each expert
+        # Input: [num_tokens*top_k, N/2] x [E, K, N/2] -> Output: [num_tokens, top_k, K]
+        # This projects back from intermediate_size to hidden_size
+        # Also applies router weights (topk_weights) to scale expert contributions
+        # ============================================================================
+        invoke_fused_moe_kernel(
+            qintermediate_cache2,    # Quantized activated values
+            w2,                      # Expert weights (downward projection)
+            intermediate_cache3,     # Output buffer
+            a2q_scale,              # Quantization scale for activations
+            self.w2_scale,          # Quantization scale for weights
+            self.w2_zp,             # Zero point for weight quantization
+            topk_weights,           # Router weights to scale expert outputs
+            sorted_token_ids,       # Token indices sorted by expert
+            expert_ids,             # Expert index for each block
+            num_tokens_post_padded, # Total tokens after padding
+            not apply_router_weight_on_input,  # Apply router weights in kernel
+            1,                      # top_k=1 for this stage (already expanded)
+            config,                 # Kernel configuration
+            compute_type=compute_type,
+            use_fp8_w8a8=self.quant_config.use_fp8_w8a8,
+            use_int8_w8a8=self.quant_config.use_int8_w8a8,
+            use_int8_w8a16=self.quant_config.use_int8_w8a16,
+            use_int4_w4a16=self.quant_config.use_int4_w4a16,
+            per_channel_quant=self.per_act_token_quant,
+            block_shape=self.block_shape,
+            B_bias=self.w2_bias,
+        )
+
+        # ============================================================================
+        # SECTION 11: FINAL REDUCTION
+        # Sum the outputs from all top-k experts for each token
+        # Input: [num_tokens, top_k_num, K] -> Output: [num_tokens, K]
+        # This aggregates the weighted contributions from multiple experts
+        # ============================================================================
+        ops.moe_sum(intermediate_cache3, output)
+
+
+
+class TritonExpertsWithLoRA(mk.FusedMoEPermuteExpertsUnpermuteWithLoRA):
+
+    def __init__(
+        self,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(quant_config)
+
+    @property
+    def activation_formats(
+        self
+    ) -> tuple[mk.FusedMoEActivationFormat, mk.FusedMoEActivationFormat]:
+        return (mk.FusedMoEActivationFormat.Standard,
+                mk.FusedMoEActivationFormat.Standard)
+
+    def supports_chunking(self) -> bool:
+        return True
+
+    def supports_expert_map(self) -> bool:
+        return True
+
+    def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
+        return TopKWeightAndReduceNoOP()
+
+    def workspace_shapes(
+        self,
+        a: torch.Tensor,
+        aq: torch.Tensor,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: Optional[mk.ExpertTokensMetadata],
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
+        workspace1 = (M, topk, max(N // 2, K))
+        workspace2 = (M, topk, max(N, K))
+        output = (M, K)
+        return (workspace1, workspace2, output, a.dtype)
+
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: str,
+        global_num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        a1q_scale: Optional[torch.Tensor],
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: Optional[mk.ExpertTokensMetadata],
+        apply_router_weight_on_input: bool,
+    ):
+
+        self.lora_w1_A = ...
+        self.lora_w1_B = ...
+        self.lora_w2_A = ...
+        self.lora_w2_B = ...
+
         # Check constraints.
         if self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), (
@@ -1660,10 +2175,12 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             moe_align_block_size(topk_ids, config['BLOCK_SIZE_M'],
                                  global_num_experts, expert_map))
 
-        invoke_fused_moe_kernel(
+        invoke_fused_moe_kernel_lora(
             hidden_states,
             w1,
             intermediate_cache1,
+            self.lora_w1_A,
+            self.lora_w1_B,
             a1q_scale,
             self.w1_scale,
             self.w1_zp,
@@ -1693,10 +2210,12 @@ class TritonExperts(mk.FusedMoEPermuteExpertsUnpermute):
             intermediate_cache2, self.a2_scale, self.quant_dtype,
             self.per_act_token_quant, self.block_shape)
 
-        invoke_fused_moe_kernel(
+        invoke_fused_moe_kernel_lora(
             qintermediate_cache2,
             w2,
             intermediate_cache3,
+            self.lora_w2_A,
+            self.lora_w2_B,
             a2q_scale,
             self.w2_scale,
             self.w2_zp,
