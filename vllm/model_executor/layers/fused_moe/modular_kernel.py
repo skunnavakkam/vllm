@@ -22,6 +22,7 @@ from vllm.v1.worker.ubatching import (dbo_enabled, dbo_maybe_run_recv_hook,
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from vllm.lora.punica_wrapper import PunicaWrapperBase
+    from vllm.model_executor.layers.fused_moe.fused_moe import MoELoRAKernelParams
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -605,6 +606,354 @@ class FusedMoEPermuteExpertsUnpermute(ABC):
         raise NotImplementedError
 
 
+class FusedMoEPermuteExpertsUnpermuteWithLoRA(ABC, BaseLayerWithLoRA):
+    """MoE permute/unpermute base that also tracks LoRA adapters for w1/w2."""
+
+    def __init__(self, quant_config: FusedMoEQuantConfig):
+        BaseLayerWithLoRA.__init__(self)
+        self.quant_config = quant_config
+        self.max_loras: int = 0
+        self.lora_config: Optional[LoRAConfig] = None
+        self.punica_wrapper: Optional["PunicaWrapperBase"] = None
+        self._lora_slots: list[_MoELoRASlot] = []
+        self._device: Optional[torch.device] = None
+        # LoRA bookkeeping to mirror BaseLinearWithLoRA expectations.
+        self.n_slices = 1
+        self.output_slices: tuple[int, ...] = ()
+
+    @property
+    @abstractmethod
+    def activation_formats(
+            self) -> tuple[FusedMoEActivationFormat, FusedMoEActivationFormat]:
+        """Input/output activation formats supported by ``apply``."""
+        raise NotImplementedError
+
+    @property
+    def quant_dtype(self) -> Optional[torch.dtype]:
+        return self.quant_config.quant_dtype
+
+    @property
+    def block_shape(self) -> Optional[list[int]]:
+        return self.quant_config.block_shape
+
+    @property
+    def per_act_token_quant(self) -> bool:
+        return self.quant_config.per_act_token_quant
+
+    @property
+    def per_out_ch_quant(self) -> bool:
+        return self.quant_config.per_out_ch_quant
+
+    @property
+    def a1_scale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.a1_scale
+
+    @property
+    def a2_scale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.a2_scale
+
+    @property
+    def a1_gscale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.a1_gscale
+
+    @property
+    def a2_gscale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.a2_gscale
+
+    @property
+    def w1_scale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w1_scale
+
+    @property
+    def w2_scale(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w2_scale
+
+    @property
+    def w1_zp(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w1_zp
+
+    @property
+    def w2_zp(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w2_zp
+
+    @property
+    def w1_bias(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w1_bias
+
+    @property
+    def w2_bias(self) -> Optional[torch.Tensor]:
+        return self.quant_config.w2_bias
+
+    @property
+    def g1_alphas(self) -> Optional[torch.Tensor]:
+        return self.quant_config.g1_alphas
+
+    @property
+    def g2_alphas(self) -> Optional[torch.Tensor]:
+        return self.quant_config.g2_alphas
+
+    @abstractmethod
+    def supports_chunking(self) -> bool:
+        """Whether this kernel supports activation chunking."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def supports_expert_map(self) -> bool:
+        """Whether this kernel supports expert maps."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def workspace_shapes(
+        self,
+        a: torch.Tensor,
+        aq: torch.Tensor,
+        M: int,
+        N: int,
+        K: int,
+        topk: int,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_tokens_meta: Optional[ExpertTokensMetadata],
+    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], torch.dtype]:
+        """Return workspace and output tensor shapes for ``apply``."""
+        raise NotImplementedError
+
+    def activation(self, activation: str, output: torch.Tensor,
+                   input: torch.Tensor) -> None:
+        assert output.size(-1) * 2 == input.size(-1)
+        if activation == "silu":
+            torch.ops._C.silu_and_mul(output, input)
+        elif activation == "gelu":
+            torch.ops._C.gelu_and_mul(output, input)
+        else:
+            raise ValueError(f"Unsupported FusedMoe activation: {activation}")
+
+    def enable_chunking(self):
+        return envs.VLLM_ENABLE_FUSED_MOE_ACTIVATION_CHUNKING and \
+          self.supports_chunking()
+
+    def finalize_weight_and_reduce_impl(self) -> TopKWeightAndReduce:
+        raise NotImplementedError
+
+    @abstractmethod
+    def apply(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: str,
+        global_num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        a1q_scale: Optional[torch.Tensor],
+        workspace13: torch.Tensor,
+        workspace2: torch.Tensor,
+        expert_tokens_meta: Optional[ExpertTokensMetadata],
+        apply_router_weight_on_input: bool,
+    ):
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # LoRA adapter management mirroring BaseLinearWithLoRA expectations.
+
+    def slice_lora_a(
+        self, lora_a: Union[torch.Tensor, list[Union[torch.Tensor, None]]]
+    ) -> Union[torch.Tensor, list[Union[torch.Tensor, None]]]:
+        return lora_a
+
+    def slice_lora_b(
+        self, lora_b: Union[torch.Tensor, list[Union[torch.Tensor, None]]]
+    ) -> Union[torch.Tensor, list[Union[torch.Tensor, None]]]:
+        return lora_b
+
+    def create_lora_weights(
+        self,
+        max_loras: int,
+        lora_config: LoRAConfig,
+        model_config: Optional["PretrainedConfig"] = None,
+    ) -> None:
+        if max_loras < 0:
+            raise ValueError(f"max_loras must be non-negative, got {max_loras}")
+        self.max_loras = max_loras
+        self.lora_config = lora_config
+        self._lora_slots = [_MoELoRASlot() for _ in range(max_loras)]
+        self._device = None
+
+    def reset_lora(self, index: int):
+        self._ensure_storage_initialized()
+        self._validate_index(index)
+        self._lora_slots[index].clear()
+
+    def set_lora(
+        self,
+        index: int,
+        lora_a: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
+        lora_b: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
+        embeddings_tensor: Optional[torch.Tensor],
+        bias: Optional[Union[torch.Tensor, Sequence[Optional[torch.Tensor]]]] = None,
+    ):
+        self._ensure_storage_initialized()
+        self._validate_index(index)
+
+        if lora_a is None or lora_b is None:
+            raise ValueError("LoRA tensors must not be None.")
+
+        device = self._determine_device(lora_a, lora_b)
+        if self._device is None:
+            self._device = device
+
+        slot = self._lora_slots[index]
+        slot.clear()
+
+        up_a, down_a = self._normalize_component_inputs(lora_a, "lora_a")
+        up_b, down_b = self._normalize_component_inputs(lora_b, "lora_b")
+        up_bias, down_bias = self._normalize_component_inputs(bias, "bias")
+
+        self._assign_component(slot.up, up_a, up_b, up_bias, device)
+        self._assign_component(slot.down, down_a, down_b, down_bias, device)
+
+        if embeddings_tensor is not None:
+            slot.embeddings_tensor = self._clone_to_device(embeddings_tensor,
+                                                           device)
+
+    def set_mapping(self, punica_wrapper):
+        self.punica_wrapper = punica_wrapper
+
+    @classmethod
+    def can_replace_layer(
+        cls,
+        source_layer: torch.nn.Module,
+        lora_config: LoRAConfig,
+        packed_modules_list: list,
+        model_config: Optional["PretrainedConfig"],
+    ) -> bool:
+        return False
+
+    def get_lora_slot(self, index: int) -> _MoELoRASlot:
+        self._ensure_storage_initialized()
+        self._validate_index(index)
+        return self._lora_slots[index]
+
+    def iter_active_loras(self) -> Iterator[tuple[int, _MoELoRASlot]]:
+        self._ensure_storage_initialized()
+        for idx, slot in enumerate(self._lora_slots):
+            if slot.has_weights():
+                yield idx, slot
+
+    def _build_lora_kernel_params(
+            self,
+            component: str,
+            *,
+            original_top_k: int,
+            activation: Optional[torch.Tensor] = None
+    ) -> Optional["MoELoRAKernelParams"]:
+        if self.punica_wrapper is None:
+            return None
+
+        components: dict[int, _LoRAComponent] = {}
+        for slot_idx, slot in self.iter_active_loras():
+            comp: _LoRAComponent = getattr(slot, component)
+            if comp is not None and comp.has_weights() and comp.rank > 0:
+                components[slot_idx] = comp
+
+        if not components:
+            return None
+
+        from vllm.model_executor.layers.fused_moe import fused_moe as fused_moe_module
+
+        params = fused_moe_module.MoELoRAKernelParams(
+            punica_wrapper=self.punica_wrapper,
+            components=components,
+            original_top_k=original_top_k,
+            input_activation=None,
+        )
+        if activation is not None:
+            params = params.with_activation(activation)
+        return params
+
+    def _clone_to_device(self, tensor: torch.Tensor,
+                         device: torch.device) -> torch.Tensor:
+        return tensor.to(device, non_blocking=True).detach().clone()
+
+    def _determine_device(
+        self,
+        lora_a: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
+        lora_b: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
+    ) -> torch.device:
+        if self._device is not None:
+            return self._device
+        for tensor in self._iter_tensor_values(lora_a):
+            return tensor.device
+        for tensor in self._iter_tensor_values(lora_b):
+            return tensor.device
+        raise ValueError("Unable to determine device from LoRA tensors.")
+
+    def _normalize_component_inputs(
+        self,
+        value: Union[torch.Tensor, Sequence[Optional[torch.Tensor]], None],
+        name: str,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if value is None:
+            return (None, None)
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ValueError(
+                    f"Expected {name} to provide two elements (up, down), "
+                    f"received {len(value)}")
+            return value[0], value[1]
+        return value, None
+
+    def _assign_component(
+        self,
+        component: _LoRAComponent,
+        lora_a: Optional[torch.Tensor],
+        lora_b: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> None:
+        component.clear()
+        if lora_a is None and lora_b is None:
+            if bias is not None:
+                raise ValueError(
+                    "Cannot provide bias without associated LoRA weights.")
+            return
+        if lora_a is None or lora_b is None:
+            raise ValueError("Both LoRA A and LoRA B must be provided together.")
+        component.lora_a = self._clone_to_device(lora_a, device)
+        component.lora_b = self._clone_to_device(lora_b, device)
+        component.rank = component.lora_b.shape[0]
+        if bias is not None:
+            component.bias = self._clone_to_device(bias, device)
+
+    def _iter_tensor_values(
+        self, value: Union[torch.Tensor, Sequence[Optional[torch.Tensor]], None]
+    ) -> Iterator[torch.Tensor]:
+        if value is None:
+            return
+        if isinstance(value, torch.Tensor):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    yield item
+
+    def _ensure_storage_initialized(self) -> None:
+        if self.max_loras and not self._lora_slots:
+            self._lora_slots = [_MoELoRASlot() for _ in range(self.max_loras)]
+        if not self._lora_slots and self.max_loras == 0:
+            raise RuntimeError(
+                "LoRA storage has not been created or has zero capacity; "
+                "call create_lora_weights() with a positive max_loras before "
+                "setting LoRA weights.")
+
+    def _validate_index(self, index: int) -> None:
+        if index < 0 or index >= self.max_loras:
+            raise IndexError(
+                f"LoRA index {index} is out of bounds for {self.max_loras} slots"
+            )
+
 def _chunk_scales(scales: Optional[torch.Tensor], start: int,
                   end: int) -> Optional[torch.Tensor]:
     if scales is not None:
@@ -1013,196 +1362,3 @@ class FusedMoEModularKernel(torch.nn.Module):
         else:
             assert shared_output is not None
             return shared_output, output
-
-@final
-class FusedMoEModularKernelWithLoRA(FusedMoEModularKernel, BaseLayerWithLoRA):
-    """Adds LoRA-aware storage on top of the modular MoE kernel."""
-
-    # Keep dedicated buffers to avoid interfering with the base class caches.
-    fused_out_buffer = SharedResizableBuffer()
-    workspace13_buffer = SharedResizableBuffer()
-    workspace2_buffer = SharedResizableBuffer()
-
-    def __init__(
-        self,
-        prepare_finalize: FusedMoEPrepareAndFinalize,
-        fused_experts: FusedMoEPermuteExpertsUnpermute,
-        shared_experts: Optional[torch.nn.Module] = None,
-    ) -> None:
-        super().__init__(prepare_finalize, fused_experts, shared_experts)
-        self.max_loras: int = 0
-        self.lora_config: Optional[LoRAConfig] = None
-        self.punica_wrapper: Optional["PunicaWrapperBase"] = None
-        self._lora_slots: list[_MoELoRASlot] = []
-        self._device: Optional[torch.device] = None
-        # LoRA-specific metadata placeholders; apply() implementation will
-        # populate them when LoRA support is completed.
-        self.n_slices = 1
-        self.output_slices: tuple[int, ...] = ()
-
-    def slice_lora_a(
-        self, lora_a: Union[torch.Tensor, list[Union[torch.Tensor, None]]]
-    ) -> Union[torch.Tensor, list[Union[torch.Tensor, None]]]:
-        return lora_a
-
-    def slice_lora_b(
-        self, lora_b: Union[torch.Tensor, list[Union[torch.Tensor, None]]]
-    ) -> Union[torch.Tensor, list[Union[torch.Tensor, None]]]:
-        return lora_b
-
-    def create_lora_weights(
-        self,
-        max_loras: int,
-        lora_config: LoRAConfig,
-        model_config: Optional["PretrainedConfig"] = None,
-    ) -> None:
-        if max_loras < 0:
-            raise ValueError(f"max_loras must be non-negative, got {max_loras}")
-        self.max_loras = max_loras
-        self.lora_config = lora_config
-        self._lora_slots = [_MoELoRASlot() for _ in range(max_loras)]
-        self._device = None
-
-    def reset_lora(self, index: int):
-        self._ensure_storage_initialized()
-        self._validate_index(index)
-        self._lora_slots[index].clear()
-
-    def set_lora(
-        self,
-        index: int,
-        lora_a: torch.Tensor,
-        lora_b: torch.Tensor,
-        embeddings_tensor: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor] = None,
-    ):
-        self._ensure_storage_initialized()
-        self._validate_index(index)
-
-        if lora_a is None or lora_b is None:
-            raise ValueError("LoRA tensors must not be None.")
-
-        device = self._determine_device(lora_a, lora_b)
-        if self._device is None:
-            self._device = device
-
-        slot = self._lora_slots[index]
-        slot.clear()
-
-        up_a, down_a = self._normalize_component_inputs(lora_a, "lora_a")
-        up_b, down_b = self._normalize_component_inputs(lora_b, "lora_b")
-        up_bias, down_bias = self._normalize_component_inputs(bias, "bias")
-
-        self._assign_component(slot.up, up_a, up_b, up_bias, device)
-        self._assign_component(slot.down, down_a, down_b, down_bias, device)
-
-        if embeddings_tensor is not None:
-            slot.embeddings_tensor = self._clone_to_device(embeddings_tensor,
-                                                           device)
-
-    def set_mapping(self, punica_wrapper):
-        self.punica_wrapper = punica_wrapper
-
-    @classmethod
-    def can_replace_layer(
-        cls,
-        source_layer: torch.nn.Module,
-        lora_config: LoRAConfig,
-        packed_modules_list: list,
-        model_config: Optional["PretrainedConfig"],
-    ) -> bool:
-        # LoRA replacement for fused MoE kernels is currently managed
-        # explicitly when constructing the layer, so do not auto-replace.
-        return False
-
-    def get_lora_slot(self, index: int) -> _MoELoRASlot:
-        self._ensure_storage_initialized()
-        self._validate_index(index)
-        return self._lora_slots[index]
-
-    def iter_active_loras(self) -> Iterator[tuple[int, _MoELoRASlot]]:
-        self._ensure_storage_initialized()
-        for idx, slot in enumerate(self._lora_slots):
-            if slot.has_weights():
-                yield idx, slot
-
-    def _clone_to_device(self, tensor: torch.Tensor,
-                         device: torch.device) -> torch.Tensor:
-        return tensor.to(device, non_blocking=True).detach().clone()
-
-    def _determine_device(
-        self,
-        lora_a: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
-        lora_b: Union[torch.Tensor, Sequence[Optional[torch.Tensor]]],
-    ) -> torch.device:
-        if self._device is not None:
-            return self._device
-        for tensor in self._iter_tensor_values(lora_a):
-            return tensor.device
-        for tensor in self._iter_tensor_values(lora_b):
-            return tensor.device
-        raise ValueError("Unable to determine device from LoRA tensors.")
-
-    def _normalize_component_inputs(
-        self,
-        value: Union[torch.Tensor, Sequence[Optional[torch.Tensor]], None],
-        name: str,
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if value is None:
-            return (None, None)
-        if isinstance(value, (list, tuple)):
-            if len(value) != 2:
-                raise ValueError(
-                    f"Expected {name} to provide two elements (up, down), "
-                    f"received {len(value)}")
-            return value[0], value[1]
-        return value, None
-
-    def _assign_component(
-        self,
-        component: _LoRAComponent,
-        lora_a: Optional[torch.Tensor],
-        lora_b: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
-        device: torch.device,
-    ) -> None:
-        component.clear()
-        if lora_a is None and lora_b is None:
-            if bias is not None:
-                raise ValueError(
-                    "Cannot provide bias without associated LoRA weights.")
-            return
-        if lora_a is None or lora_b is None:
-            raise ValueError("Both LoRA A and LoRA B must be provided together.")
-        component.lora_a = self._clone_to_device(lora_a, device)
-        component.lora_b = self._clone_to_device(lora_b, device)
-        component.rank = component.lora_b.shape[0]
-        if bias is not None:
-            component.bias = self._clone_to_device(bias, device)
-
-    def _iter_tensor_values(
-        self, value: Union[torch.Tensor, Sequence[Optional[torch.Tensor]], None]
-    ) -> Iterator[torch.Tensor]:
-        if value is None:
-            return
-        if isinstance(value, torch.Tensor):
-            yield value
-        elif isinstance(value, (list, tuple)):
-            for item in value:
-                if isinstance(item, torch.Tensor):
-                    yield item
-
-    def _ensure_storage_initialized(self) -> None:
-        if self.max_loras and not self._lora_slots:
-            self._lora_slots = [_MoELoRASlot() for _ in range(self.max_loras)]
-        if not self._lora_slots and self.max_loras == 0:
-            raise RuntimeError(
-                "LoRA storage has not been created or has zero capacity; "
-                "call create_lora_weights() with a positive max_loras before "
-                "setting LoRA weights.")
-
-    def _validate_index(self, index: int) -> None:
-        if index < 0 or index >= self.max_loras:
-            raise IndexError(
-                f"LoRA index {index} is out of bounds for {self.max_loras} slots"
-            )
